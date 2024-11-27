@@ -11,6 +11,8 @@
 #include <misc/qseecom_kernel.h>
 #include <trace/hooks/bl_hib.h>
 #include <linux/reboot.h>
+#include <soc/qcom/smci_clientenv.h>
+#include <soc/qcom/smci_low_power_key_mgr.h>
 
 #define AUTH_SIZE		16
 #define AUTH_TAG		0xFF
@@ -20,6 +22,9 @@
 	((x + QSEECOM_ALIGN_MASK) & (~QSEECOM_ALIGN_MASK))
 
 typedef __u32 __bitwise blk_opf_t;
+
+static struct smci_object client_env = {0};
+static struct smci_object key_mgr_object = {0};
 
 struct s4app_time {
 	uint16_t year;
@@ -594,12 +599,64 @@ static void cleanup_cmp_blk_array(void)
 	}
 }
 
+static int setup(void)
+{
+	int ret = 0;
+
+	ret =  get_client_env_object(&client_env);
+	if (ret) {
+		pr_err("Failed to get client env object, ret = %d\n", ret);
+		return ret;
+	}
+
+	ret = smci_clientenv_open(client_env, CLOWPOWERKEYMANAGER_UID,
+				  &key_mgr_object);
+	if (ret)
+		pr_err("Failed to get Key Manager object, ret = %d\n", ret);
+
+	return ret;
+}
+
+static void cleanup(void)
+{
+	SMCI_OBJECT_ASSIGN_NULL(key_mgr_object);
+	SMCI_OBJECT_ASSIGN_NULL(client_env);
+}
+
+int key_mgr_get_key(uint32_t event, void *key, size_t key_len,
+		    size_t *key_len_out)
+{
+	int ret = setup();
+
+	if (ret)
+		goto exit;
+
+	ret = ILowPowerKeyManager_getKey(key_mgr_object, event, key,
+					 key_len, key_len_out);
+exit:
+	cleanup();
+	return ret;
+}
+
+int key_mgr_prepare(uint32_t event, const ILOWPOWERKEYMANAGER_key_info *key_info)
+{
+	int ret = setup();
+
+	if (ret)
+		goto exit;
+
+	ret = ILowPowerKeyManager_prepare(key_mgr_object, event, key_info);
+exit:
+	cleanup();
+	return ret;
+}
+
 static int hibernate_pm_notifier(struct notifier_block *nb,
 				unsigned long event, void *unused)
 {
 	int ret = NOTIFY_DONE;
-
-	switch (event) {
+  
+        switch (event) {
 
 	case (PM_HIBERNATION_PREPARE):
 		params = kmalloc(sizeof(struct qcom_crypto_params), GFP_KERNEL);
@@ -612,7 +669,23 @@ static int hibernate_pm_notifier(struct notifier_block *nb,
 			goto err_aead;
 		}
 
-		ret = init_ta_and_set_key();
+		#ifdef CONFIG_QCOM_KERNEL_SEC_KEY
+			size_t key_len_out;
+			ILOWPOWERKEYMANAGER_key_info *key_info;
+			key_info = kmalloc(sizeof(ILOWPOWERKEYMANAGER_key_info), GFP_KERNEL);
+			if (!key_info)
+				return NOTIFY_BAD;
+			ret = key_mgr_prepare(ILOWPOWERKEYMANAGER_key_info, key_info);
+			if (ret) {
+				pr_err("%s: Failed to init QTEE: %d\n", __func__, ret);
+				goto err_setkey;
+			}
+			ret = key_mgr_get_key(ILOWPOWERKEYMANAGER_HIBERNATE_WITH_ENCRYPTION, key,
+					AES256_KEY_SIZE, &key_len_out);
+
+		#else
+			ret = init_ta_and_set_key();
+		#endif
 		if (ret) {
 			pr_err("%s: Failed to init TA: %d\n", __func__, ret);
 			goto err_setkey;
@@ -632,6 +705,21 @@ static int hibernate_pm_notifier(struct notifier_block *nb,
 		cleanup_cmp_blk_array();
 		break;
 
+	case (PM_RESTORE_PREPARE):
+		#ifdef CONFIG_QCOM_KERNEL_SEC_KEY
+			ret = key_mgr_get_key(ILOWPOWERKEYMANAGER_HIBERNATE_WITH_ENCRYPTION, key,
+					AES256_KEY_SIZE, &key_len_out);
+			if (ret) {
+				pr_err("%s: PM_RESTORE_PREPARE: Unable to restore key from QTEE: %d\n",
+						__func__, ret);
+				return NOTIFY_STOP;
+			}
+		#endif
+		break;
+	case (PM_POST_RESTORE):
+		deinit_aes_encrypt();
+		cleanup_cmp_blk_array();
+		break;
 	default:
 		WARN_ONCE(1, "Invalid PM Notifier\n");
 		break;
