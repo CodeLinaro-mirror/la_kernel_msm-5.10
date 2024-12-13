@@ -566,6 +566,7 @@ struct cnss_plat_data {
 	u8 charger_mode;
 	/* WLAN driver provided bandwidth vote */
 	int current_bw_vote;
+	struct kobject *wifi_kobj;
 	u16 hang_event_data_len;
 	u32 hang_data_addr_offset;
 	/* bitmap to detect FEM combination */
