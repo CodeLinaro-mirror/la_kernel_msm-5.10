@@ -817,6 +817,9 @@ static int __init qcom_secure_hibernattion_init(void)
 {
 	int ret;
 
+#ifndef CONFIG_HIBERNATION
+	return 0;
+#endif
 	register_trace_android_vh_encrypt_page(encrypt_page, NULL);
 	register_trace_android_vh_init_aes_encrypt(init_aes_encrypt, NULL);
 	register_trace_android_vh_skip_swap_map_write(skip_swap_map_write, NULL);
