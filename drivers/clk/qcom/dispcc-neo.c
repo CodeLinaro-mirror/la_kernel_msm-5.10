@@ -1868,7 +1868,7 @@ static struct clk_regmap *disp_cc_neo_clocks[] = {
 
 /*
  * Enable clock gating for MDP clocks
- * disp_cc_xo_clk
+ * Enable disp_cc_xo_clk
  */
 static struct critical_clk_offset critical_clk_list[] = {
 	{ .offset = 0xF000, .mask = BIT(4) },
