@@ -1244,6 +1244,7 @@ void gen7_snapshot(struct adreno_device *adreno_dev,
 	u32 cgc = 0, cgc1 = 0, cgc2 = 0;
 	int is_current_rt;
 
+	gpucore = to_gen7_core(ADRENO_DEVICE(device));
 	gen7_crashdump_timedout = false;
 	gen7_snapshot_block_list = gpucore->gen7_snapshot_block_list;
 	cp_indexed_reglist = gen7_snapshot_block_list->cp_indexed_reg_list;
