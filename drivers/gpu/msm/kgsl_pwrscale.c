@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2010-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022, 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022, 2024-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/devfreq_cooling.h>
@@ -677,6 +677,10 @@ static int thermal_max_notifier_call(struct notifier_block *nb, unsigned long va
 	pwr->thermal_pwrlevel = level;
 
 	mutex_lock(&device->mutex);
+
+	/* If RT hint is active, send thermal constraint to GMU */
+	if (pwr->rt_pwrlevel_hint != INVALID_DCVS_IDX)
+		device->ftbl->set_thermal_index(device);
 
 	/* Update the current level using the new limit */
 	kgsl_pwrctrl_pwrlevel_change(device, pwr->active_pwrlevel);

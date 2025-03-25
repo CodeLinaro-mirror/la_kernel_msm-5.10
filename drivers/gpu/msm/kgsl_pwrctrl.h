@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2010-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 #ifndef __KGSL_PWRCTRL_H
 #define __KGSL_PWRCTRL_H
@@ -176,6 +176,8 @@ struct kgsl_pwrctrl {
 	u32 rt_bus_hint;
 	/** @rt_bus_hint_active: Boolean flag to indicate if RT bus hint is active */
 	bool rt_bus_hint_active;
+	/** @rt_pwrlevel_hint: power level hint for real time clients i.e. RB-0 */
+	u32 rt_pwrlevel_hint;
 };
 
 int kgsl_pwrctrl_init(struct kgsl_device *device);

@@ -165,6 +165,8 @@
 #define ADRENO_HW_FENCE BIT(16)
 /* Dynamic Mode Switching supported on this target */
 #define ADRENO_DMS BIT(17)
+/* RT hint feature for RB0 workloads */
+#define ADRENO_RT_HINT BIT(23)
 
 
 /*
@@ -450,6 +452,8 @@ struct adreno_power_ops {
 		u32 ab);
 	/** @register_gdsc_notifier: Target specific function to register gdsc notifier */
 	int (*register_gdsc_notifier)(struct adreno_device *adreno_dev);
+	/** @set_thermal_index: Function ops for sending thermal constraint to GMU */
+	void (*set_thermal_index)(struct adreno_device *adreno_dev);
 };
 
 /**
