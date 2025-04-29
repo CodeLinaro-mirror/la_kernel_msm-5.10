@@ -13,7 +13,11 @@
 #include <linux/reboot.h>
 #include <soc/qcom/smci_clientenv.h>
 #include <soc/qcom/smci_low_power_key_mgr.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/init.h>
 
+#define ILOWPOWERKEYMANAGER_ERROR_INVALID_OPERATION_CHECK 11
 #define AUTH_SIZE		16
 #define AUTH_TAG		0xFF
 #define QSEECOM_ALIGN_SIZE      0x40
@@ -23,6 +27,9 @@
 
 typedef __u32 __bitwise blk_opf_t;
 
+
+static bool gethibkey_value = false;
+static struct kobject *gethibkey_kobj;
 static struct smci_object client_env = {0};
 static struct smci_object key_mgr_object = {0};
 
@@ -83,7 +90,9 @@ static struct crypto_aead *tfm;
 static struct aead_request *req;
 static u8 iv_size;
 static u8 key[AES256_KEY_SIZE];
+#ifndef CONFIG_QCOM_KERNEL_SEC_KEY
 static struct qseecom_handle *app_handle;
+#endif
 static int first_encrypt;
 static void *temp_out_buf;
 static int pos;
@@ -97,10 +106,12 @@ static int blk_array_pos;
 static unsigned long nr_pages;
 static void *auth_slot;
 
+#ifndef CONFIG_QCOM_KERNEL_SEC_KEY
 static void generate_random_key(void)
 {
 	get_random_bytes(key, AES256_KEY_SIZE);
 }
+#endif
 
 static void init_sg(struct scatterlist *sg, void *data, unsigned int size)
 {
@@ -483,6 +494,7 @@ static struct notifier_block poweroff_nb = {
 	.notifier_call = poweroff_notifier,
 };
 
+#ifndef CONFIG_QCOM_KERNEL_SEC_KEY
 static int get_key_from_ta(void)
 {
 	int ret;
@@ -515,6 +527,7 @@ static int get_key_from_ta(void)
 	}
 	return ret;
 }
+#endif
 
 static int init_aead(void)
 {
@@ -528,6 +541,7 @@ static int init_aead(void)
 	return 0;
 }
 
+#ifndef CONFIG_QCOM_KERNEL_SEC_KEY
 static int init_ta_and_set_key(void)
 {
 	const uint32_t shared_buffer_len = 4096;
@@ -553,6 +567,7 @@ static int init_ta_and_set_key(void)
 
 	return ret;
 }
+#endif
 
 static int alloc_auth_memory(void)
 {
@@ -651,11 +666,68 @@ exit:
 	return ret;
 }
 
+#ifdef CONFIG_QCOM_KERNEL_SEC_KEY
+
+
+void print_key(void) {
+	int i;
+	for (i = 0; i < AES256_KEY_SIZE; i++) {
+		pr_debug("%u ", key[i]);
+	}
+}
+
+int get_key_for_hib_exp(void)
+{
+        int qtee_ret = 0;
+        size_t key_len_out;
+
+        ILOWPOWERKEYMANAGER_key_info *key_info;
+
+        pr_err("%s: Getting key from SSG",__func__);
+        key_info = kmalloc(sizeof(ILOWPOWERKEYMANAGER_key_info), GFP_KERNEL);
+        key_info->key_size = AES256_KEY_SIZE;
+
+        qtee_ret = key_mgr_prepare(ILOWPOWERKEYMANAGER_HIBERNATE_WITH_ENCRYPTION, key_info);
+	if(qtee_ret){
+	        if (qtee_ret == ILOWPOWERKEYMANAGER_ERROR_INVALID_OPERATION_CHECK) {
+			pr_err("%s: Thrashing the old key.. %d %d", qtee_ret, ILOWPOWERKEYMANAGER_ERROR_INVALID_OPERATION);
+			qtee_ret = key_mgr_get_key(ILOWPOWERKEYMANAGER_HIBERNATE_WITH_ENCRYPTION, key,
+					AES256_KEY_SIZE, &key_len_out);
+			if (qtee_ret) {
+				pr_err("%s: Failed to init QTEE: key_mgr_get_key: %d\n", __func__, qtee_ret);
+				return qtee_ret;
+			}
+			qtee_ret = key_mgr_prepare(ILOWPOWERKEYMANAGER_HIBERNATE_WITH_ENCRYPTION, key_info);
+			if (qtee_ret) {
+	        	        pr_err("%s: Failed to init QTEE: key_mgr_prepare: %d\n", __func__, qtee_ret);
+				return qtee_ret;
+			}
+		} else {
+			pr_err("%s: Failed to init QTEE: key_mgr_prepare: %d\n", __func__, qtee_ret);
+			return qtee_ret;
+		}
+	}
+
+        qtee_ret = key_mgr_get_key(ILOWPOWERKEYMANAGER_HIBERNATE_WITH_ENCRYPTION, key,
+				AES256_KEY_SIZE, &key_len_out);
+        if (qtee_ret) {
+                pr_err("%s: Failed to get Key: %d\n", __func__, qtee_ret);
+	} else {
+	        print_key();
+	}
+
+	return qtee_ret;
+}
+EXPORT_SYMBOL_GPL(get_key_for_hib_exp);
+#endif
+
 static int hibernate_pm_notifier(struct notifier_block *nb,
 				unsigned long event, void *unused)
 {
 	int ret = NOTIFY_DONE;
-  
+#ifdef CONFIG_QCOM_KERNEL_SEC_KEY
+	size_t key_len_out;
+#endif 
         switch (event) {
 
 	case (PM_HIBERNATION_PREPARE):
@@ -669,28 +741,13 @@ static int hibernate_pm_notifier(struct notifier_block *nb,
 			goto err_aead;
 		}
 
-		#ifdef CONFIG_QCOM_KERNEL_SEC_KEY
-			size_t key_len_out;
-			ILOWPOWERKEYMANAGER_key_info *key_info;
-			key_info = kmalloc(sizeof(ILOWPOWERKEYMANAGER_key_info), GFP_KERNEL);
-			if (!key_info)
-				return NOTIFY_BAD;
-			ret = key_mgr_prepare(ILOWPOWERKEYMANAGER_key_info, key_info);
-			if (ret) {
-				pr_err("%s: Failed to init QTEE: %d\n", __func__, ret);
-				goto err_setkey;
-			}
-			ret = key_mgr_get_key(ILOWPOWERKEYMANAGER_HIBERNATE_WITH_ENCRYPTION, key,
-					AES256_KEY_SIZE, &key_len_out);
-
-		#else
-			ret = init_ta_and_set_key();
-		#endif
+		#ifndef CONFIG_QCOM_KERNEL_SEC_KEY
+		ret = init_ta_and_set_key();
 		if (ret) {
 			pr_err("%s: Failed to init TA: %d\n", __func__, ret);
 			goto err_setkey;
 		}
-
+		#endif
 		temp_out_buf = (void *)__get_free_pages(GFP_KERNEL, 1);
 		if (!temp_out_buf) {
 			pr_err("%s: Failed alloc_auth_memory %d\n", __func__, ret);
@@ -714,6 +771,7 @@ static int hibernate_pm_notifier(struct notifier_block *nb,
 						__func__, ret);
 				return NOTIFY_STOP;
 			}
+			print_key();
 		#endif
 		break;
 	case (PM_POST_RESTORE):
@@ -813,6 +871,32 @@ static void hibernate_save_cmp_len(void *data, size_t cmp_len)
 	compressed_blk_array[blk_array_pos++] = pages;
 }
 
+
+static ssize_t gethibkey_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	return snprintf(buf, AES256_KEY_SIZE, "%d\n", gethibkey_value);
+}
+
+static ssize_t gethibkey_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	bool new_value;
+	int ret = kstrtobool(buf, &new_value);
+	if (ret < 0)
+		return ret;
+
+	gethibkey_value = new_value;
+
+	if (gethibkey_value) {
+		pr_err("Calling get_key_for_hib_exp..");
+		get_key_for_hib_exp();
+	}
+
+	pr_err("Received: %s", buf);
+	return count;
+}
+
+static struct kobj_attribute gethibkey_attr = __ATTR(gethibkey, 0664, gethibkey_show, gethibkey_store);
+
 static int __init qcom_secure_hibernattion_init(void)
 {
 	int ret;
@@ -827,6 +911,14 @@ static int __init qcom_secure_hibernattion_init(void)
 	register_trace_android_vh_hibernate_save_cmp_len(hibernate_save_cmp_len, NULL);
 	register_trace_android_vh_hibernated_do_mem_alloc(hibernated_do_mem_alloc, NULL);
 	register_trace_android_vh_decrypt_page(decrypt_page, NULL);
+
+	gethibkey_kobj = kobject_create_and_add("gethibkey_kobject", kernel_kobj);
+	if (!gethibkey_kobj)
+		return -ENOMEM;
+
+	ret = sysfs_create_file(gethibkey_kobj, &gethibkey_attr.attr);
+	if (ret)
+		kobject_put(gethibkey_kobj);
 
 	ret = register_pm_notifier(&pm_nb);
 	if (ret) {
