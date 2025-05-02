@@ -266,8 +266,10 @@ static long ps_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case GENERATE_HIB_KEY:
 	case POWER_STATE_GENERATE_HIB_KEY:
+#ifdef CONFIG_QCOM_KERNEL_SEC_KEY
 		ret = get_key_for_hib_exp();	
 		pr_info("Generated sec hib key successfully..\n");
+#endif
 		break;
 	case LPM_ACTIVE:
 	case POWER_STATE_LPM_ACTIVE:
