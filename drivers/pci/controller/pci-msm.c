@@ -4825,10 +4825,8 @@ static int msm_pcie_enable(struct msm_pcie_dev_t *dev)
 
 	/* enable power */
 	ret = msm_pcie_vreg_init(dev);
-	if (ret) {
-		msm_pcie_gpio_deinit(dev);
-		goto out;
-	}
+	if (ret)
+		goto vreg_fail;
 
 	/* enable clocks */
 	ret = msm_pcie_clk_init(dev);
@@ -5062,6 +5060,8 @@ link_fail:
 	msm_pcie_clk_deinit(dev);
 clk_fail:
 	msm_pcie_vreg_deinit(dev);
+vreg_fail:
+	msm_pcie_gpio_deinit(dev);
 out:
 	mutex_unlock(&dev->setup_lock);
 
