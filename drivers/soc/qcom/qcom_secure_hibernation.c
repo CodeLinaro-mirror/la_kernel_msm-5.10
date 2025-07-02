@@ -122,6 +122,15 @@ static void init_sg(struct scatterlist *sg, void *data, unsigned int size)
 
 static void save_auth(uint8_t *out_buf)
 {
+	int i;
+	u8 *auth_ptr = out_buf + PAGE_SIZE;
+
+	if (pos<=2)
+		pr_err("Auth pos:%d\n",pos);
+	for (i = 0; i < AUTH_SIZE && pos<=2; ++i) {
+		pr_err("%02x ", auth_ptr[i]);
+	}
+
 	memcpy(authslot_start + (pos * AUTH_SIZE), out_buf + PAGE_SIZE,
 		AUTH_SIZE);
 	pos++;
@@ -136,7 +145,9 @@ static void encrypt_page(void *data, void *buf)
 {
 	struct scatterlist sg_in[2], sg_out[2];
 	struct crypto_wait wait;
-	int ret = 0;
+	int i,ret = 0;
+	unsigned char *test_buf_before = (unsigned char *)buf;
+	unsigned char *test_buf_after = (unsigned char *)temp_out_buf;
 
 	/* Allocate a request object */
 	req = aead_request_alloc(tfm, GFP_KERNEL);
@@ -175,6 +186,21 @@ static void encrypt_page(void *data, void *buf)
 		goto out;
 	}
 
+	if (pos<=2)
+		pr_err("iv:%d\n",pos);
+		for (i = 0; i < IV_SIZE && pos<=2; ++i)
+			pr_err("%02x ", iv[i]);
+	if (pos<=2)
+		pr_err("Buf before:%d\n",pos);
+	for (i = 0; i < AUTH_SIZE && pos<=2; ++i)
+		pr_err("%02x ", test_buf_before[i]);
+
+	if (pos<=2)
+		pr_err("Buf after:%d\n",pos);
+	for (i = 0; i < AUTH_SIZE && pos<=2; ++i)
+		pr_err("%02x ", test_buf_after[i]);
+
+	memcpy(buf, temp_out_buf, PAGE_SIZE);
 	save_auth(temp_out_buf);
 
 	if (first_encrypt)
@@ -202,12 +228,11 @@ static void decrypt_page(void *data, void *buf)
 	struct aead_request *decrypt_req = NULL;
 	void *decrypt_temp_out_buf = NULL;
 	unsigned char iv_decrypt[IV_SIZE];
-	static struct crypto_aead *decrypt_tfm;
-
-	decrypt_tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+	//unsigned char *test_buf_before = (unsigned char *)buf;
+	//unsigned char *test_buf_after = (unsigned char *)decrypt_temp_out_buf;
 
 	/* Allocate a request object */
-	decrypt_req = aead_request_alloc(decrypt_tfm, GFP_KERNEL);
+	decrypt_req = aead_request_alloc(tfm, GFP_KERNEL);
 	if (!decrypt_req) {
 		pr_err("[%s]: Error allocating aead req\n", __func__);
 		return;
@@ -217,18 +242,18 @@ static void decrypt_page(void *data, void *buf)
 	aead_request_set_callback(decrypt_req, CRYPTO_TFM_REQ_MAY_BACKLOG,
 			crypto_req_done, &wait);
 
-	ret = crypto_aead_setauthsize(decrypt_tfm, AUTH_SIZE);
+	ret = crypto_aead_setauthsize(tfm, AUTH_SIZE);
 
-	iv_size = crypto_aead_ivsize(decrypt_tfm);
+	iv_size = crypto_aead_ivsize(tfm);
 	if (iv_size)
 		memset(iv_decrypt, AUTH_TAG, iv_size);
 
-	ret = crypto_aead_setkey(decrypt_tfm, key, AES256_KEY_SIZE);
+	ret = crypto_aead_setkey(tfm, key, AES256_KEY_SIZE);
 	if (ret) {
 		pr_err("Error setting key: %d\n", ret);
 		goto out;
 	}
-	crypto_aead_clear_flags(decrypt_tfm, ~0);
+	crypto_aead_clear_flags(tfm, ~0);
 	decrypt_temp_out_buf = (void *)__get_free_pages(GFP_KERNEL, 1);
 	if (!decrypt_temp_out_buf) {
 		pr_err("[%s]: Error allocating memory for decryption output buffer\n", __func__);
@@ -241,9 +266,15 @@ static void decrypt_page(void *data, void *buf)
 	memset(buf, 0, PAGE_SIZE);
 	init_sg_decrypt(sg_out, buf, PAGE_SIZE);
 	aead_request_set_ad(decrypt_req, 12);
+
 	aead_request_set_crypt(decrypt_req, sg_in, sg_out, PAGE_SIZE + AUTH_SIZE, iv_decrypt);
 	crypto_aead_decrypt(decrypt_req);
 	crypto_wait_req(ret, &wait);
+
+	if (pos<=2)
+		pr_err("Decrypting page completed..");
+	pos++;
+
 	if (ret) {
 		goto fail;
 	}
@@ -410,12 +441,15 @@ static void save_auth_and_params_to_disk(struct work_struct *work)
 	struct hib_bio_batch hb;
 	int err2, i = 0;
 
+	pr_err("Queued save_auth_and_params_to_disk..");
 	hib_init_batch(&hb);
 
 	/*
 	 * Allocate a page to save the encryption params
 	 */
 	params_slot = alloc_swapdev_block(root_swap_dev);
+	pr_err("root_swap_dev:%hu",root_swap_dev);
+	pr_err("params_slot:%d",params_slot);
 
 	if (auth_slot) {
 		*(int *)auth_slot = params_slot + 1;
@@ -435,17 +469,21 @@ static void save_auth_and_params_to_disk(struct work_struct *work)
 		 * authentication slot number. This data will be stored at index as
 		 * that of the first swap_map_page.
 		 */
+		pr_err("write_page 1 auth_slot");
 		write_page(auth_slot, 1, &hb);
 	}
 
 	authpage = authslot_start;
+	pr_err("authpage_count:%d", authpage_count);
 	while (authslot_count < authpage_count) {
 		cur_slot = alloc_swapdev_block(root_swap_dev);
 		write_page(authpage, cur_slot, &hb);
 		authpage = (unsigned char *)authpage + PAGE_SIZE;
 		authslot_count++;
 	}
+	pr_err("write_page params_slot, authslot_count:%d", authslot_count);
 	params->authslot_count = authslot_count;
+	pr_err("writing params_slot:%d",params_slot);
 	write_page(params, params_slot, &hb);
 
 	/*
@@ -453,9 +491,10 @@ static void save_auth_and_params_to_disk(struct work_struct *work)
 	 */
 	if (compressed_blk_array) {
 		uint32_t size = get_size_of_compression_block_array(nr_pages);
-
+		pr_err("get_size_of_compression_block_array size:%u",size);
 		for (i = 0; i < size / PAGE_SIZE; i++) {
 			cur_slot = alloc_swapdev_block(root_swap_dev);
+			pr_err("write_page compressed_blk_array, cur_slot:%d", cur_slot);
 			write_page(compressed_blk_array + (i * PAGE_SIZE), cur_slot, &hb);
 		}
 	}
@@ -467,6 +506,7 @@ static void save_auth_and_params_to_disk(struct work_struct *work)
 
 static void save_params_to_disk(void *data, unsigned short root_swap)
 {
+	pr_err("save_params_to_disk..");
 	root_swap_dev = root_swap;
 	queue_work(system_wq, &save_params_work);
 }
@@ -567,6 +607,7 @@ static int init_ta_and_set_key(void)
 
 	return ret;
 }
+
 #endif
 
 static int alloc_auth_memory(void)
@@ -580,6 +621,7 @@ static int alloc_auth_memory(void)
 	authslot_start = vmalloc(total_auth_size);
 	if (!authslot_start)
 		return -ENOMEM;
+	pr_err("%s: authslot_count:%u, total_auth_size:%lu",__func__,params->authslot_count,total_auth_size);
 	return 0;
 }
 
@@ -763,6 +805,10 @@ static int hibernate_pm_notifier(struct notifier_block *nb,
 		break;
 
 	case (PM_RESTORE_PREPARE):
+		ret = init_aead();
+		if (ret) {
+			pr_err("%s: Failed init_aead(): %d\n", __func__, ret);
+		}
 		#ifdef CONFIG_QCOM_KERNEL_SEC_KEY
 			ret = key_mgr_get_key(ILOWPOWERKEYMANAGER_HIBERNATE_WITH_ENCRYPTION, key,
 					AES256_KEY_SIZE, &key_len_out);
@@ -844,6 +890,7 @@ static void hibernated_do_mem_alloc(void *data, unsigned long pages,
 
 	/* total no. of pages in the snapshot image */
 	nr_pages = pages;
+	pr_err("%s: total_snapshot_pages:%lu..",__func__, pages);
 
 	if (!(swsusp_header_flags & SF_NOCOMPRESS_MODE)) {
 		size = get_size_of_compression_block_array(pages);
