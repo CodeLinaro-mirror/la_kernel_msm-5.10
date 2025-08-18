@@ -7,7 +7,7 @@
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
  *
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include "kxr_aphost.h"
@@ -397,7 +397,10 @@ static int kxr_aphost_driver_remove(struct spi_device *spi)
 static int kxr_aphost_suspend(struct device *dev)
 {
 	struct kxr_aphost *aphost = (struct kxr_aphost *) kxr_aphost_get_drv_data(dev);
-
+	if (aphost->gpio_ledr != NULL)
+		gpiod_set_value(aphost->gpio_ledr, 0);
+	if (aphost->gpio_ledl != NULL)
+		gpiod_set_value(aphost->gpio_ledl, 0);
 	kxr_aphost_power_mode_set(aphost, KXR_SPI_POWER_MODE_OFF);
 	return 0;
 }
