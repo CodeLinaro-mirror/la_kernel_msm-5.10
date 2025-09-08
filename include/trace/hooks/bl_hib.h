@@ -35,6 +35,10 @@ DECLARE_HOOK(android_vh_skip_swap_map_write,
 	TP_PROTO(bool *skip),
 	TP_ARGS(skip));
 
+DECLARE_HOOK(android_vh_store_auth_slot_num,
+	TP_PROTO(uint32_t *auth_slot_num),
+	TP_ARGS(auth_slot_num));
+
 DECLARE_HOOK(android_vh_post_image_save,
 	TP_PROTO(unsigned short root_swap),
 	TP_ARGS(root_swap));

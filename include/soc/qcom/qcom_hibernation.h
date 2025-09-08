@@ -31,7 +31,7 @@ struct qcom_crypto_params {
 	unsigned char key_blob[WRAPPED_KEY_SIZE];
 	unsigned char iv[IV_SIZE];
 	unsigned char aad[12];
-};
+} __packed;
 
 struct hib_bio_batch {
 	atomic_t		count;

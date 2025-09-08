@@ -34,6 +34,7 @@
 
 #include "power.h"
 
+#define AUTH_SLOT	0
 #define HIBERNATE_SIG	"S1SUSPEND"
 int pos;
 
@@ -225,6 +226,9 @@ static unsigned short root_swap = 0xffff;
 struct block_device *hib_resume_bdev;
 EXPORT_SYMBOL_GPL(hib_resume_bdev);
 
+uint32_t swap_auth_slot_offset;
+EXPORT_SYMBOL_GPL(swap_auth_slot_offset);
+
 struct hib_bio_batch {
 	atomic_t		count;
 	wait_queue_head_t	wait;
@@ -323,15 +327,18 @@ static int hib_wait_io(struct hib_bio_batch *hb)
 static int mark_swapfiles(struct swap_map_handle *handle, unsigned int flags)
 {
 	int error;
+	uint32_t auth_slot = 0;
 
 	hib_submit_io(REQ_OP_READ, 0, swsusp_resume_block,
 		      swsusp_header, NULL);
 	if (!memcmp("SWAP-SPACE",swsusp_header->sig, 10) ||
 	    !memcmp("SWAPSPACE2",swsusp_header->sig, 10)) {
+		trace_android_vh_store_auth_slot_num(&auth_slot);
 		memcpy(swsusp_header->orig_sig,swsusp_header->sig, 10);
 		memcpy(swsusp_header->sig, HIBERNATE_SIG, 10);
 		swsusp_header->image = handle->first_sector;
 		swsusp_header->flags = flags;
+		((uint32_t *)(swsusp_header->reserved))[AUTH_SLOT] = auth_slot;
 		if (flags & SF_CRC32_MODE)
 			swsusp_header->crc32 = handle->crc32;
 		error = hib_submit_io(REQ_OP_WRITE, REQ_SYNC,
@@ -691,8 +698,7 @@ static int compress_threadfn(void *data)
 						&cmp_len);
 		d->cmp_len = cmp_len;
 
-		//atomic_set(&compressed_size, atomic_read(&compressed_size) + d->cmp_len);
-		atomic_set_release(&compressed_size, atomic_read(&compressed_size) + d->cmp_len);
+		atomic_set(&compressed_size, atomic_read(&compressed_size) + d->cmp_len);
 		atomic_set_release(&d->stop, 1);
 		wake_up(&d->done);
 	}
@@ -1610,6 +1616,8 @@ int swsusp_check(void)
 	if (!IS_ERR(hib_resume_bdev)) {
 		set_blocksize(hib_resume_bdev, PAGE_SIZE);
 		clear_page(swsusp_header);
+		swsusp_header = (struct swsusp_header *)__get_free_page(GFP_NOIO | __GFP_NOWARN |
+                                                __GFP_NORETRY);
 		error = hib_submit_io(REQ_OP_READ, 0,
 					swsusp_resume_block,
 					swsusp_header, NULL);
@@ -1619,6 +1627,7 @@ int swsusp_check(void)
 		if (!memcmp(HIBERNATE_SIG, swsusp_header->sig, 10)) {
 			memcpy(swsusp_header->sig, swsusp_header->orig_sig, 10);
 			swsusp_header_flags = swsusp_header->flags;
+			swap_auth_slot_offset =  ((uint32_t *)(swsusp_header->reserved))[AUTH_SLOT];
 			/* Reset swap signature now */
 			error = hib_submit_io(REQ_OP_WRITE, REQ_SYNC,
 						swsusp_resume_block,
