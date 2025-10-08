@@ -167,7 +167,8 @@
 #define ADRENO_DMS BIT(17)
 /* RT hint feature for RB0 workloads */
 #define ADRENO_RT_HINT BIT(23)
-
+/* Enable GMU Based AB voting */
+#define ADRENO_GMU_AB BIT(28)
 
 /*
  * Adreno GPU quirks - control bits for various workarounds
