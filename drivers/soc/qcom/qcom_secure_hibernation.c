@@ -7,6 +7,7 @@
 #include <linux/scatterlist.h>
 #include <crypto/aead.h>
 #include <soc/qcom/qcom_hibernation.h>
+#include <soc/qcom/qcom_hibernation.h>	/* for QCOM_CRYPTO_PARAMS_VERSION */
 #include <../../../kernel/power/power.h>
 #include <misc/qseecom_kernel.h>
 #include <trace/hooks/bl_hib.h>
@@ -21,6 +22,7 @@
 #include <crypto/hash.h>
 #include <linux/slab.h>
 #include <linux/jhash.h>
+
 
 #define SHA1_DIGEST_SIZE 20
 #define MAX_BIO_AUTHPAGES	200
@@ -112,6 +114,7 @@ static struct qcom_crypto_params *params, *decrypt_params;
 static struct crypto_aead *tfm;
 static struct aead_request *req;
 static u8 iv_size;
+static bool tfm_configured;
 static uint8_t *decrypt_authtags;
 static int decrypt_auth_idx;
 static u8 key[AES256_KEY_SIZE];
@@ -185,6 +188,9 @@ static void save_auth(uint8_t *out_buf, unsigned int sec_pos)
 		pos_offset = sec_pos * AUTH_SIZE;
 	}
 
+	if (!save_hashmap && params && sec_pos >= params->authslot_count)
+		return;
+
 	memcpy(authslot_start + pos_offset, out_buf + PAGE_SIZE, AUTH_SIZE);
 	if (save_hashmap) {
 		compute_sha1(out_buf, PAGE_SIZE, sha1_digest);
@@ -244,6 +250,7 @@ static void encrypt_page(void *data, void *buf, sector_t offset)
 		get_random_bytes(params->iv, iv_size);
 		memcpy((void *)iv, params->iv, IV_SIZE);
 		base_offset = offset;
+		pre_offset = offset;
 	}
 
 	ret = crypto_aead_setkey(tfm, key, AES256_KEY_SIZE);
@@ -258,12 +265,20 @@ static void encrypt_page(void *data, void *buf, sector_t offset)
 	init_sg(sg_out, temp_out_buf, PAGE_SIZE + AUTH_SIZE);
 	aead_request_set_ad(req, sizeof(params->aad));
 
-                        if (offset > pre_offset) {
-                                increment_iv(iv, IV_SIZE, offset - pre_offset);
-                        } else {
-				memcpy((void *)iv, params->iv, IV_SIZE);
-                                increment_iv(iv, IV_SIZE, pre_offset - offset);
-			}
+	/*
+	 * Dynamic IV:
+	 * Treat params->iv as the IV for the first encrypted page (base_offset),
+	 * and derive subsequent IVs as: IV = base_iv + (offset - base_offset).
+	 *
+	 * Fast-path uses deltas for increasing offsets; recompute for backwards
+	 * offsets.
+	 */
+	if (offset >= pre_offset) {
+		increment_iv(iv, IV_SIZE, offset - pre_offset);
+	} else {
+		memcpy((void *)iv, params->iv, IV_SIZE);
+		increment_iv(iv, IV_SIZE, offset - base_offset);
+	}
 
 	aead_request_set_crypt(req, sg_in, sg_out, PAGE_SIZE, iv);
 	ret = crypto_aead_encrypt(req);
@@ -381,7 +396,7 @@ static void hib_init_batch(struct hib_bio_batch *hb)
 int init_aes_decrypt(void)
 {
 
-	int authslot_base, params_slot, ret, i;
+	int authslot_base, params_slot, ret;
 	unsigned long total_size, offset;
 	unsigned int num_pages;
 	unsigned int sha_val;
@@ -409,15 +424,14 @@ int init_aes_decrypt(void)
 		return ret;
 	}
 	decrypt_params = (struct qcom_crypto_params *)decrypt_params_buf;
+	/* verify params version for backward compatibility */
+	if (decrypt_params->version != QCOM_CRYPTO_PARAMS_VERSION) {
+		pr_err("qcom_secure_hibernation: unsupported params version %u\n",
+		       decrypt_params->version);
+		return -EINVAL;
+	}
 	pr_info("Read crypto params: authsize=%u, authslot_count=%u\n",
 					decrypt_params->authsize, decrypt_params->authslot_count);
-
-	pr_info("decrypt_params->iv:");
-	for (i = 0; i < IV_SIZE; ++i)
-		pr_cont("%02x", decrypt_params->iv[i]);
-	pr_info("decrypt_params->aad:");
-	for (i = 0; i < 12; ++i)
-		pr_cont("%02x", decrypt_params->aad[i]);
 
 	if (!decrypt_params->authslot_count)
 		return -EINVAL;
@@ -470,6 +484,11 @@ int init_aes_decrypt(void)
 
 	pr_info("Read %zu pages of AuthTags from swap\n", num_pages);
 	first_decrypt = 1;
+	pre_offset = 0;
+	base_offset = 0;
+	decrypt_auth_idx = 0;
+	success_pages = 0;
+	fail_pages = 0;
 
 	pr_info("Hibernation: AES init done\n");
 	return 0;
@@ -498,13 +517,13 @@ static void init_sg_decrypt(struct scatterlist *sg, void *data, unsigned int siz
 static void decrypt_page(void *data, void *buf, sector_t offset)
 {
 	struct scatterlist sg_in[2], sg_out[2];
-	struct crypto_wait wait;
-	int i, ret = 0;
+	int ret = 0;
 	struct aead_request *decrypt_req = NULL;
-	uint8_t *decrypt_temp_out_buf = kmalloc(PAGE_SIZE + AUTH_SIZE, GFP_KERNEL);
-	uint8_t *auth_tag = kmalloc(AUTH_SIZE, GFP_KERNEL);
+	uint8_t *decrypt_temp_out_buf = kmalloc(PAGE_SIZE + AUTH_SIZE, GFP_ATOMIC);
+	uint8_t *auth_tag = kmalloc(AUTH_SIZE, GFP_ATOMIC);
 	uint8_t sha1_digest[SHA1_DIGEST_SIZE];
 	unsigned int sha_val;
+	sector_t tag_idx = 0;
 
 	offset = offset / 8;
 	if (save_hashmap) {
@@ -520,31 +539,35 @@ static void decrypt_page(void *data, void *buf, sector_t offset)
 	}
 
 	/* Allocate a request object */
-	decrypt_req = aead_request_alloc(tfm, GFP_KERNEL);
+	decrypt_req = aead_request_alloc(tfm, GFP_ATOMIC);
 	if (!decrypt_req) {
 		pr_err("[%s]: Error allocating aead req\n", __func__);
-		return;
+		ret = -ENOMEM;
+		goto fail;
 	}
 
-	crypto_init_wait(&wait);
-	aead_request_set_callback(decrypt_req, CRYPTO_TFM_REQ_MAY_BACKLOG,
-			crypto_req_done, &wait);
-
-	ret = crypto_aead_setauthsize(tfm, AUTH_SIZE);
+	aead_request_set_callback(decrypt_req, 0, NULL, NULL);
 	iv_size = crypto_aead_ivsize(tfm);
 	if (iv_size && first_decrypt && !save_hashmap) {
 		base_offset = offset;
 		memcpy((void *)iv, decrypt_params->iv, IV_SIZE);
-	}
-	ret = crypto_aead_setkey(tfm, key, AES256_KEY_SIZE);
-	if (ret) {
-		pr_err("Error setting key: %d\n", ret);
-		goto out;
+		pre_offset = offset;
 	}
 	crypto_aead_clear_flags(tfm, ~0);
 
-	if (!save_hashmap)
-		get_authtag(offset - base_offset, auth_tag);
+	if (!decrypt_temp_out_buf || !auth_tag) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+
+	if (!save_hashmap) {
+		tag_idx = offset - base_offset;
+		if (unlikely(tag_idx >= decrypt_params->authslot_count)) {
+			ret = -EINVAL;
+			goto fail;
+		}
+		get_authtag(tag_idx, auth_tag);
+	}
 
 	memcpy(decrypt_temp_out_buf, buf, PAGE_SIZE);
 	memcpy(decrypt_temp_out_buf + PAGE_SIZE, (void *)auth_tag, AUTH_SIZE);
@@ -552,15 +575,17 @@ static void decrypt_page(void *data, void *buf, sector_t offset)
 	init_sg_decrypt(sg_out, buf, PAGE_SIZE);
 	aead_request_set_ad(decrypt_req, 12);
 	if (!save_hashmap) {
-		if (first_decrypt) {
-			increment_iv(iv, IV_SIZE, 3);
+		/*
+		 * Dynamic IV:
+		 * Treat decrypt_params->iv as the IV for the first decrypted page
+		 * (base_offset) and derive: IV = base_iv + (offset - base_offset).
+		 * Mirror encrypt_page() derivation.
+		 */
+		if (!first_decrypt && offset >= pre_offset) {
+			increment_iv(iv, IV_SIZE, offset - pre_offset);
 		} else {
-			if (offset > pre_offset) {
-				increment_iv(iv, IV_SIZE, offset - pre_offset);
-			} else {
-				memcpy((void *)iv, decrypt_params->iv, IV_SIZE);
-				increment_iv(iv, IV_SIZE, offset - base_offset + 3);
-			}
+			memcpy((void *)iv, decrypt_params->iv, IV_SIZE);
+			increment_iv(iv, IV_SIZE, offset - base_offset);
 		}
 	}
 
@@ -568,39 +593,22 @@ static void decrypt_page(void *data, void *buf, sector_t offset)
 	ret = crypto_aead_decrypt(decrypt_req);
 	if (ret) {
 		fail_pages++;
-		pr_err("Failed in decrypting page:%d with ret%d..\n", decrypt_auth_idx, ret);
-		pr_err("offset:%llu, pre_offset:%llu", offset, pre_offset);
-		pr_err("auth_tag:");
-		for (i = 0; i < AUTH_SIZE; i++)
-			pr_cont("%02x", auth_tag[i]);
-		pr_err("Buf:");
-		for (i = 0; i < AUTH_SIZE; i++)
-			pr_cont("%02x", decrypt_temp_out_buf[i]);
-		pr_err("iv:");
-		for (i = 0; i < IV_SIZE; i++)
-			pr_cont("%02x", iv[i]);
-		pr_err("success:%d, fail:%d", success_pages, fail_pages);
 	} else {
 		success_pages++;
 	}
 	pre_offset = offset;
 	decrypt_auth_idx++;
-	crypto_wait_req(ret, &wait);
+
 	if (first_decrypt)
 		first_decrypt = 0;
-
-	if (ret) {
-		goto fail;
-	}
 
 fail:
 	if (decrypt_temp_out_buf)
 		kfree(decrypt_temp_out_buf);
 	if (auth_tag)
 		kfree(auth_tag);
-out:
-	aead_request_free(decrypt_req);
-
+	if (decrypt_req)
+		aead_request_free(decrypt_req);
 	return;
 }
 
@@ -894,12 +902,39 @@ static int get_key_from_ta(void)
 static int init_aead(void)
 {
 	if (!tfm) {
-		tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+		/*
+		 * Prefer synchronous generic implementation: decrypt hook runs
+		 * from bio end_io context and must not sleep waiting for async
+		 * crypto completion.
+		 */
+		tfm = crypto_alloc_aead("gcm(aes-generic)", 0, 0);
+		if (IS_ERR(tfm))
+			tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
 		if (IS_ERR(tfm)) {
 			pr_err("Error crypto_alloc_aead: %d\n",	PTR_ERR(tfm));
 			return PTR_ERR(tfm);
 		}
+		tfm_configured = false;
 	}
+	return 0;
+}
+
+static int configure_tfm(void)
+{
+	int ret;
+
+	if (tfm_configured)
+		return 0;
+
+	ret = crypto_aead_setauthsize(tfm, AUTH_SIZE);
+	if (ret)
+		return ret;
+
+	ret = crypto_aead_setkey(tfm, key, AES256_KEY_SIZE);
+	if (ret)
+		return ret;
+
+	tfm_configured = true;
 	return 0;
 }
 
@@ -962,6 +997,7 @@ void deinit_aes_encrypt(void)
 		crypto_free_aead(tfm);
 		tfm = NULL;
 	}
+	tfm_configured = false;
 
 	memset(key, 0, AES256_KEY_SIZE);
 	memset(params->key_blob, 0, WRAPPED_KEY_SIZE);
@@ -1115,6 +1151,11 @@ static int hibernate_pm_notifier(struct notifier_block *nb,
 			pr_err("%s: Failed to init TA: %d\n", __func__, ret);
 			goto err_setkey;
 		}
+		ret = configure_tfm();
+		if (ret) {
+			pr_err("%s: Failed to configure AEAD: %d\n", __func__, ret);
+			goto err_setkey;
+		}
 		#endif
 		temp_out_buf = (void *)__get_free_pages(GFP_KERNEL, 1);
 		if (!temp_out_buf) {
@@ -1142,6 +1183,7 @@ static int hibernate_pm_notifier(struct notifier_block *nb,
 						__func__, ret);
 				return NOTIFY_STOP;
 			}
+				pr_err("%s: PM_RESTORE_PREPARE: INIT_AES_DECRYPT: %s\n",__func__);
 			ret = key_mgr_get_key(ILOWPOWERKEYMANAGER_HIBERNATE_WITH_ENCRYPTION, key,
 					AES256_KEY_SIZE, &key_len_out);
 			if (ret) {
@@ -1149,6 +1191,14 @@ static int hibernate_pm_notifier(struct notifier_block *nb,
 						__func__, ret);
 				return NOTIFY_STOP;
 			}
+				pr_err("%s: PM_RESTORE_PREPARE: key_mgr_get_key: %s\n",__func__);
+			ret = configure_tfm();
+			if (ret) {
+				pr_err("%s: PM_RESTORE_PREPARE: Unable to configure AEAD: %d\n",
+				       __func__, ret);
+				return NOTIFY_STOP;
+			}
+				pr_err("%s: PM_RESTORE_PREPARE: configure_tfm: %s\n",__func__);
 			print_key();
 		#endif
 		break;
@@ -1190,6 +1240,8 @@ static void init_aes_encrypt(void *data, void *unused)
 	#ifdef CONFIG_QCOM_USE_STATIC_KEY
 		generate_random_key();
 	#endif
+	/* mark on-disk params struct version for compatibility check */
+	params->version = QCOM_CRYPTO_PARAMS_VERSION;
 	ret = alloc_auth_memory();
 	if (ret) {
 		pr_err("%s: Failed alloc_auth_memory %d\n", __func__, ret);
@@ -1198,6 +1250,10 @@ static void init_aes_encrypt(void *data, void *unused)
 
 	first_encrypt = 1;
 	pos = 0;
+	pre_offset = 0;
+	base_offset = 0;
+	success_pages = 0;
+	fail_pages = 0;
 	memcpy(params->aad, "SECURE_S2D!!", sizeof(params->aad));
 	params->authsize = AUTH_SIZE;
 	memset(params->key_blob, 0, WRAPPED_KEY_SIZE);
