@@ -9,6 +9,8 @@
 #include <linux/blk_types.h>
 #include <linux/blkdev.h>
 
+#define QCOM_CRYPTO_PARAMS_VERSION	1
+
 #define AES256_KEY_SIZE		32
 #define NUM_KEYS		2
 #define PAYLOAD_KEY_SIZE	(AES256_KEY_SIZE * NUM_KEYS)
@@ -26,6 +28,8 @@
 #define IV_SIZE			12
 
 struct qcom_crypto_params {
+	uint8_t version;
+	uint8_t reserved_pad[3];
 	unsigned int authsize;
 	unsigned int authslot_count;
 	unsigned char key_blob[WRAPPED_KEY_SIZE];
