@@ -104,8 +104,10 @@ struct cmd_rsp {
 	uint32_t status;
 };
 
+sector_t base_offset;
+sector_t pre_offset;
 static struct auth_entry *entry;
-static int save_hashmap = 1;
+static int save_hashmap = 0;
 static struct qcom_crypto_params *params, *decrypt_params;
 static struct crypto_aead *tfm;
 static struct aead_request *req;
@@ -171,7 +173,7 @@ static void init_sg(struct scatterlist *sg, void *data, unsigned int size)
 	sg_set_buf(&sg[1], data, size);
 }
 
-static void save_auth(uint8_t *out_buf)
+static void save_auth(uint8_t *out_buf, unsigned int sec_pos)
 {
 
 	uint8_t sha1_digest[SHA1_DIGEST_SIZE];
@@ -180,7 +182,7 @@ static void save_auth(uint8_t *out_buf)
 	if (save_hashmap) {
 		pos_offset = pos * (AUTH_SIZE + SHA1_DIGEST_SIZE + IV_SIZE);
 	} else {
-		pos_offset = pos * AUTH_SIZE;
+		pos_offset = sec_pos * AUTH_SIZE;
 	}
 
 	memcpy(authslot_start + pos_offset, out_buf + PAGE_SIZE, AUTH_SIZE);
@@ -203,31 +205,28 @@ static void store_auth_slot_num(void *data, uint32_t *auth_slot_num)
 	*auth_slot_num = (uint32_t) auth_slot_offset;
 }
 
-static void increment_iv(unsigned char *iv, u8 size)
+void increment_iv(uint8_t *iv, uint8_t size, uint64_t val)
 {
-	int i;
-	u16 num, carry = 1;
-	unsigned long flags;
+	int i = size - 1;
+	uint64_t num;
+	uint64_t mask = 0xFF;
 
-	spin_lock_irqsave(&iv_lock, flags);
-	i = size - 1;
-	do {
-		num = (u8)iv[i];
-		num += carry;
-		iv[i] = num & 0xFF;
-		carry = (num > 0xFF) ? 1 : 0;
+	while (i >= 0 && val != 0) {
+		num = (uint64_t)iv[i];
+		num += val;
+		iv[i] = (uint8_t)(num & mask);
+		val = (num > mask) ? ((num & ~mask) >> 8) : 0;
 		i--;
-	} while (i >= 0 && carry != 0);
-	spin_unlock_irqrestore(&iv_lock, flags);
-
+	}
 }
 
-static void encrypt_page(void *data, void *buf)
+static void encrypt_page(void *data, void *buf, sector_t offset)
 {
 	struct scatterlist sg_in[2], sg_out[2];
 	struct crypto_wait wait;
 	int ret = 0;
 
+	offset = offset / 8;
 	/* Allocate a request object */
 	req = aead_request_alloc(tfm, GFP_KERNEL);
 	if (!req) {
@@ -244,6 +243,7 @@ static void encrypt_page(void *data, void *buf)
 	if (iv_size && first_encrypt) {
 		get_random_bytes(params->iv, iv_size);
 		memcpy((void *)iv, params->iv, IV_SIZE);
+		base_offset = offset;
 	}
 
 	ret = crypto_aead_setkey(tfm, key, AES256_KEY_SIZE);
@@ -258,7 +258,13 @@ static void encrypt_page(void *data, void *buf)
 	init_sg(sg_out, temp_out_buf, PAGE_SIZE + AUTH_SIZE);
 	aead_request_set_ad(req, sizeof(params->aad));
 
-	increment_iv(iv, IV_SIZE);
+                        if (offset > pre_offset) {
+                                increment_iv(iv, IV_SIZE, offset - pre_offset);
+                        } else {
+				memcpy((void *)iv, params->iv, IV_SIZE);
+                                increment_iv(iv, IV_SIZE, pre_offset - offset);
+			}
+
 	aead_request_set_crypt(req, sg_in, sg_out, PAGE_SIZE, iv);
 	ret = crypto_aead_encrypt(req);
 	if (ret)
@@ -270,8 +276,9 @@ static void encrypt_page(void *data, void *buf)
 		goto out;
 	}
 
+	pre_offset = offset;
 	memcpy(buf, temp_out_buf, PAGE_SIZE);
-	save_auth(temp_out_buf);
+	save_auth(temp_out_buf, offset - base_offset);
 
 	if (first_encrypt)
 		first_encrypt = 0;
@@ -488,7 +495,7 @@ static void init_sg_decrypt(struct scatterlist *sg, void *data, unsigned int siz
 	sg_set_buf(&sg[1], data, size);
 }
 
-static void decrypt_page(void *data, void *buf)
+static void decrypt_page(void *data, void *buf, sector_t offset)
 {
 	struct scatterlist sg_in[2], sg_out[2];
 	struct crypto_wait wait;
@@ -499,6 +506,7 @@ static void decrypt_page(void *data, void *buf)
 	uint8_t sha1_digest[SHA1_DIGEST_SIZE];
 	unsigned int sha_val;
 
+	offset = offset / 8;
 	if (save_hashmap) {
 		compute_sha1(buf, PAGE_SIZE, sha1_digest);
 		sha_val = jhash(sha1_digest, SHA1_DIGEST_SIZE, 0);
@@ -525,6 +533,7 @@ static void decrypt_page(void *data, void *buf)
 	ret = crypto_aead_setauthsize(tfm, AUTH_SIZE);
 	iv_size = crypto_aead_ivsize(tfm);
 	if (iv_size && first_decrypt && !save_hashmap) {
+		base_offset = offset;
 		memcpy((void *)iv, decrypt_params->iv, IV_SIZE);
 	}
 	ret = crypto_aead_setkey(tfm, key, AES256_KEY_SIZE);
@@ -535,31 +544,46 @@ static void decrypt_page(void *data, void *buf)
 	crypto_aead_clear_flags(tfm, ~0);
 
 	if (!save_hashmap)
-		get_authtag(decrypt_auth_idx, auth_tag);
+		get_authtag(offset - base_offset, auth_tag);
 
 	memcpy(decrypt_temp_out_buf, buf, PAGE_SIZE);
 	memcpy(decrypt_temp_out_buf + PAGE_SIZE, (void *)auth_tag, AUTH_SIZE);
 	init_sg_decrypt(sg_in, decrypt_temp_out_buf, PAGE_SIZE + AUTH_SIZE);
 	init_sg_decrypt(sg_out, buf, PAGE_SIZE);
 	aead_request_set_ad(decrypt_req, 12);
-	if (!save_hashmap)
-		increment_iv(iv, IV_SIZE);
+	if (!save_hashmap) {
+		if (first_decrypt) {
+			increment_iv(iv, IV_SIZE, 3);
+		} else {
+			if (offset > pre_offset) {
+				increment_iv(iv, IV_SIZE, offset - pre_offset);
+			} else {
+				memcpy((void *)iv, decrypt_params->iv, IV_SIZE);
+				increment_iv(iv, IV_SIZE, offset - base_offset + 3);
+			}
+		}
+	}
 
 	aead_request_set_crypt(decrypt_req, sg_in, sg_out, PAGE_SIZE + AUTH_SIZE, iv);
 	ret = crypto_aead_decrypt(decrypt_req);
 	if (ret) {
 		fail_pages++;
 		pr_err("Failed in decrypting page:%d with ret%d..\n", decrypt_auth_idx, ret);
+		pr_err("offset:%llu, pre_offset:%llu", offset, pre_offset);
 		pr_err("auth_tag:");
 		for (i = 0; i < AUTH_SIZE; i++)
 			pr_cont("%02x", auth_tag[i]);
-		pr_err("sha1:");
-		for (i = 0; i < SHA1_DIGEST_SIZE; i++)
-			pr_cont("%02x", sha1_digest[i]);
+		pr_err("Buf:");
+		for (i = 0; i < AUTH_SIZE; i++)
+			pr_cont("%02x", decrypt_temp_out_buf[i]);
+		pr_err("iv:");
+		for (i = 0; i < IV_SIZE; i++)
+			pr_cont("%02x", iv[i]);
 		pr_err("success:%d, fail:%d", success_pages, fail_pages);
 	} else {
 		success_pages++;
 	}
+	pre_offset = offset;
 	decrypt_auth_idx++;
 	crypto_wait_req(ret, &wait);
 	if (first_decrypt)

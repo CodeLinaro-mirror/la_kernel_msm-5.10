@@ -260,12 +260,12 @@ static void hib_end_io(struct bio *bio)
 			 (unsigned long long)bio->bi_iter.bi_sector);
 	}
 
-	if (bio_data_dir(bio) == READ){
-		trace_android_vh_decrypt_page(page_to_virt(page));
-	}
+	if (bio_data_dir(bio) == READ)
+		trace_android_vh_decrypt_page(page_to_virt(page), bio->bi_iter.bi_sector);
 
-	if (bio_data_dir(bio) == WRITE)
+	if (bio_data_dir(bio) == WRITE){
 		put_page(page);
+	}
 	else if (clean_pages_on_read)
 		flush_icache_range((unsigned long)page_address(page),
 				   (unsigned long)page_address(page) + PAGE_SIZE);
@@ -476,7 +476,9 @@ static int swap_write_page(struct swap_map_handle *handle, void *buf,
 	if (!handle->cur)
 		return -EINVAL;
 	offset = alloc_swapdev_block(root_swap);
-	//pr_err("%s: root_swap:%d, offset:%llu",__func__,root_swap, offset);
+	if (hb)
+		trace_android_vh_encrypt_page(buf, offset * (PAGE_SIZE >> 9));
+
 	error = write_page(buf, offset, hb);
 	if (error)
 		return error;
@@ -591,7 +593,6 @@ static int save_image(struct swap_map_handle *handle,
 		ret = snapshot_read_next(snapshot);
 		if (ret <= 0)
 			break;
-		trace_android_vh_encrypt_page(data_of(*snapshot));
 		ret = swap_write_page(handle, data_of(*snapshot), &hb);
 		if (ret)
 			break;
@@ -892,7 +893,6 @@ static int save_compressed_image(struct swap_map_handle *handle,
 			     off += PAGE_SIZE) {
 				memcpy(page, data[thr].cmp + off, PAGE_SIZE);
 
-				trace_android_vh_encrypt_page(page);
 				ret = swap_write_page(handle, page, &hb);
 				if (ret)
 					goto out_finish;
