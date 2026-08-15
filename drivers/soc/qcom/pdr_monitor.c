@@ -67,7 +67,7 @@ static char *read_symbol_file(struct device *dev, const char *path, size_t *size
 	int ret;
 	const struct firmware *symtab = NULL;
 
-	ret = request_firmware(&symtab, path, dev);
+	ret = request_firmware_direct(&symtab, path, dev);
 	if (ret < 0) {
 		dev_err(dev, "request_firmware failed: %s (%d)\n", path, ret);
 		return ERR_PTR(ret);
@@ -263,6 +263,20 @@ static void pdr_monitor_callback(int state, char *service_path, void *priv)
 	mutex_unlock(&pdr_mon->services_lock);
 }
 
+static int pdr_monitor_freeze(struct device *dev)
+{
+	struct pdr_monitor *pdr_mon = dev_get_drvdata(dev);
+
+	/*
+	 * Flush any in-flight crash work before the system image is frozen.
+	 * New PDR DOWN notifications arriving after this point will queue
+	 * fresh work; that work will run normally after thaw/restore since
+	 * the workqueue is not WQ_FREEZABLE.
+	 */
+	flush_workqueue(pdr_mon->crash_wq);
+	return 0;
+}
+
 static int pdr_monitor_parse_dt(struct pdr_monitor *pdr_mon)
 {
 	struct device_node *node = pdr_mon->dev->of_node;
@@ -328,7 +342,18 @@ static int pdr_monitor_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, pdr_mon);
 
-	pdr_mon->crash_wq = alloc_ordered_workqueue("pdr_crash_wq", WQ_FREEZABLE);
+	/*
+	 * Do NOT use WQ_FREEZABLE. The task freezer runs before dpm_suspend(),
+	 * so a WQ_FREEZABLE workqueue is frozen while PDR DOWN notifications
+	 * (triggered by ADSP shutdown during hibernate) are still arriving.
+	 * freeze_workqueues_busy() would spin until the freeze timeout fires,
+	 * blocking hibernation indefinitely.
+	 *
+	 * Instead, pdr_monitor_freeze() explicitly flushes in-flight work
+	 * at the right point in the hibernate sequence (dev->pm_ops.freeze),
+	 * after ADSP has been shut down and all PDR notifications have landed.
+	 */
+	pdr_mon->crash_wq = alloc_ordered_workqueue("pdr_crash_wq", 0);
 	if (!pdr_mon->crash_wq) {
 		dev_err(&pdev->dev, "Failed to create workqueue\n");
 		return -ENOMEM;
@@ -387,6 +412,13 @@ static int pdr_monitor_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct dev_pm_ops pdr_monitor_pm_ops = {
+	.freeze  = pdr_monitor_freeze,
+	.thaw    = NULL,
+	.restore = NULL,
+	.poweroff = pdr_monitor_freeze,
+};
+
 static const struct of_device_id pdr_monitor_of_match[] = {
 	{ .compatible = "qcom,pdr-monitor"},
 	{}
@@ -399,6 +431,7 @@ static struct platform_driver pdr_monitor_driver = {
 	.driver = {
 		.name = "pdr_monitor",
 		.of_match_table = pdr_monitor_of_match,
+		.pm = &pdr_monitor_pm_ops,
 	},
 };
 
